@@ -1,0 +1,101 @@
+#!groovy
+
+
+// Shared library source files: https://bitbucket.org/energycomponents/jenkins-shared-library/src/master/vars/
+@Library('ec-shared-library@master') _
+
+
+// Pipeline start, for upgrade-scripts@INT-4827-Automation-to-build-upgraded-db
+pipeline {
+    agent {
+        label 'ssh-agent'
+    }
+    tools {
+        jdk 'OpenJDK 11'
+        maven 'M 3.5'
+        'com.cloudbees.jenkins.plugins.customtools.CustomTool' 'utplsql'
+    }
+    options {
+        disableConcurrentBuilds()
+        skipDefaultCheckout()
+    }
+    environment {
+        SKIP_UNIT_TESTS='true'
+    }
+	parameters {
+       
+        string(name: 'DB_IMAGE_PATH', defaultValue: '13.0.0-RC4', description: 'REMEMBER TO CHANGE, for this Oracle19-PR')
+        choice(name: 'PUBLISH_DB_IMAGE', choices: ['NO', 'YES'], description: 'Should Publish upgraded db docker image in nexus?')
+    }
+    
+    stages {
+        
+        stage('docker pull and utplsql installation '){
+            steps {
+                jLog("STAGE $STAGE_NAME")
+
+                jDockerCleanup()
+                withCredentials([usernamePassword(credentialsId: 'repository_user', passwordVariable: 'DOCKER_PW', usernameVariable: 'DOCKER_USER')]) {
+                    sh "docker login -u $DOCKER_USER -p $DOCKER_PW ${DOCKER_REGISTRY}"
+				}	
+					sh "docker pull ${DOCKER_REGISTRY}/${DB_IMAGE_PATH}"
+					sh "docker run --rm -d -p 1521:1521 --name source_db ${DOCKER_REGISTRY}/${DB_IMAGE_PATH}"
+						timeout(120) {
+							waitUntil {
+								echo "waiting for docker db to start"
+									script {
+										def wait = sh script: "docker inspect --format='{{json .State.Health.Status}}' source_db | grep '\"healthy\"'", returnStatus: true
+										return (wait == 0)
+									}
+							}
+						}
+					sh """	
+					    mkdir install1
+					    cd install1
+					    sudo apt-get install unzip -y
+					    curl -LOk https://github.com/utPLSQL/utPLSQL/releases/download/v3.1.5/utPLSQL.zip
+					    sudo unzip utPLSQL.zip 
+					    pwd
+					    docker cp utPLSQL  source_db:/tmp
+					    
+						docker exec -u oracle source_db bash -i -c "cd /tmp/utPLSQL/source  && sqlplus / as sysdba @/tmp/utPLSQL/source/install_headless.sql"
+					"""
+                jLog("STAGE $STAGE_NAME DONE")
+            }
+        }
+		stage('docker, tag') {
+            steps {
+                jLog("STAGE $STAGE_NAME")
+
+                sh "docker commit source_db source_db:${BUILD_ID}"
+                sh "docker stop source_db"
+
+                jLog("STAGE $STAGE_NAME DONE")
+            }
+        }
+        stage('docker, publish') {
+			when {
+                // Only publish artifact if a "PUBLISH_DB_IMAGE" is requested
+                expression { params.PUBLISH_DB_IMAGE == 'YES' }
+            }
+            
+            steps {
+                jLog("STAGE $STAGE_NAME")
+				script {
+                    DOCKER_BASE = env.UPG_VERSION =~ /SNAPSHOT/ ? "${DOCKER_REGISTRY_SNAPSHOT}" : "${DOCKER_REGISTRY_RELEASE}"
+                }
+                withCredentials([usernamePassword(credentialsId: 'repository_user', passwordVariable: 'DOCKER_PW', usernameVariable: 'DOCKER_USER')]) {
+                    sh """
+						docker login -u $DOCKER_USER -p $DOCKER_PW ${DOCKER_BASE}
+						docker tag source_db:${BUILD_ID} ${DOCKER_BASE}/${DB_IMAGE_PATH}
+                        docker push ${DOCKER_BASE}/${DB_IMAGE_PATH}
+                    """
+                
+
+                
+				}
+                jLog("STAGE $STAGE_NAME DONE")
+            }
+        }
+	}
+}
