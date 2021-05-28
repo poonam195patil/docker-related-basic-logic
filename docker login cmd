@@ -1,0 +1,9 @@
+DOCKER_LOGIN='NO'
+for i in {1..100} ; do
+    if docker login -u ${username} -p ${password} $docker-registry-url; then
+        DOCKER_LOGIN='YES'
+        break
+    else
+        sleep 30s
+    fi
+done
